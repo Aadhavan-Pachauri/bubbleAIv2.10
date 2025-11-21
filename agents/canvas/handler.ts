@@ -1,0 +1,89 @@
+
+import { GoogleGenAI } from "@google/genai";
+import { AgentInput, AgentOutput, AgentExecutionResult } from '../types';
+import { canvasAgentInstruction } from './instructions';
+import { getUserFriendlyError } from '../errorUtils';
+
+// Helper for retrying Gemini calls
+const generateContentStreamWithRetry = async (
+    ai: GoogleGenAI, 
+    params: any, 
+    retries = 3,
+    onRetry?: (msg: string) => void
+) => {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await ai.models.generateContentStream(params);
+        } catch (error: any) {
+            const isQuotaError = error.status === 429 || 
+                                 (error.message && error.message.includes('429')) ||
+                                 (error.message && error.message.includes('quota'));
+            
+            if (isQuotaError && attempt < retries) {
+                const delay = Math.pow(2, attempt) * 2000 + 1000;
+                console.warn(`Quota limit hit. Retrying in ${delay}ms...`);
+                if (onRetry) onRetry(`(Rate limit hit. Retrying in ${Math.round(delay/1000)}s...)`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                throw error;
+            }
+        }
+    }
+    throw new Error("Max retries exceeded");
+};
+
+export const runCanvasAgent = async (input: AgentInput): Promise<AgentExecutionResult> => {
+    const { prompt, apiKey, project, chat, onStreamChunk } = input;
+    
+    try {
+        const ai = new GoogleGenAI({ apiKey });
+
+        // We use the specific preview model for high-quality code generation with thinking
+        const response = await generateContentStreamWithRetry(ai, {
+            model: 'gemini-3-pro-preview',
+            contents: [
+                { 
+                    role: 'user', 
+                    parts: [{ text: `Build request: "${prompt}"` }] 
+                }
+            ],
+            config: { 
+                // Thinking Config enabled for better reasoning
+                thinkingConfig: { thinkingBudget: 2048 },
+                // High output limit for full applications
+                maxOutputTokens: 65536,
+                systemInstruction: canvasAgentInstruction,
+                temperature: 0.7, // Slightly higher for creativity
+            }
+        }, 3, (msg) => onStreamChunk?.(msg));
+
+        let finalResponseText = "";
+
+        for await (const chunk of response) {
+            if (chunk.text) {
+                finalResponseText += chunk.text;
+                onStreamChunk?.(chunk.text);
+            }
+        }
+
+        const aiMessage: AgentOutput[0] = {
+            project_id: project.id,
+            chat_id: chat.id,
+            sender: 'ai',
+            text: finalResponseText,
+        };
+
+        return { messages: [aiMessage] };
+
+    } catch (error) {
+        console.error("Error in runCanvasAgent:", error);
+        const errorMessage = getUserFriendlyError(error);
+        const fallbackMessage: AgentOutput[0] = {
+            project_id: project.id,
+            chat_id: chat.id,
+            sender: 'ai',
+            text: `I tried to generate the canvas, but hit a snag: ${errorMessage}`
+        };
+        return { messages: [fallbackMessage] };
+    }
+};
